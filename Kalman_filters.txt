@@ -1,0 +1,211 @@
+//@version=5
+strategy("Kalman Adaptive Scalper — MCX Silver Micro",
+     overlay=false,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=2,
+     commission_type=strategy.commission.percent,
+     commission_value=0.1,
+     calc_on_every_tick=false,
+     process_orders_on_close=true)
+
+// ═══════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════
+
+// Kalman Filter
+kalmQ   = input.float(0.013, "Kalman Process Noise (Q)",      group="Kalman Filter", step=0.001,
+     tooltip="Controls how quickly Kalman tracks price. Lower=smoother/slower. Higher=noisier/faster. 0.005–0.02 recommended for scalping.")
+kalmR   = input.float(1.1,  "Kalman Measurement Noise (R)",  group="Kalman Filter", step=0.1,
+     tooltip="Trust in price measurement. Higher=Kalman trusts its own model more. Lower=trusts raw price more.")
+
+// Entry threshold
+entryThresh  = input.float(2.1, "Entry Threshold (ATR multiples)", group="Entry", step=0.1,
+     tooltip="How far price must deviate from Kalman (in ATR units) to qualify as entry. 1.0–1.5 targets ~100 trades/40 days on 3m.")
+exitThresh   = input.float(0.4, "Exit Threshold (ATR multiples)",  group="Entry", step=0.1,
+     tooltip="Exit when residual reverts to within this many ATRs of Kalman estimate.")
+
+// Regime filter — Variance Ratio (Hurst proxy)
+// VR < 1 = mean-reverting, VR > 1 = trending
+// We only take mean-reversion trades when VR < threshold
+vrLen        = input.int(36,   "Variance Ratio Lookback",     group="Regime Filter",
+     tooltip="Number of bars to compute variance ratio over. 15–25 bars on 3m is effective for intraday regime detection.")
+vrThreshold  = input.float(0.7,"Max Variance Ratio (VR<1=MR)",group="Regime Filter", step=0.05,
+     tooltip="Only trade when VR is below this. VR<0.9 confirms mean-reverting regime. Raise to 1.0 to loosen, lower to 0.8 to tighten.")
+
+// Kalman velocity filter
+// Kills entries when the fair value estimate is itself moving fast
+// (means a trend is developing, not a reversion opportunity)
+velLen       = input.int(9,    "Velocity Smoothing",          group="Velocity Filter")
+maxVelMult   = input.float(0.9,"Max Velocity (ATR multiples)",group="Velocity Filter", step=0.1,
+     tooltip="If Kalman is moving faster than this * ATR, no entry. Prevents fading genuine breakouts.")
+
+// ATR
+atrLen       = input.int(13,   "ATR Length",                  group="ATR")
+atrMult      = input.float(2.2,"ATR Trail Stop Multiplier",   group="ATR", step=0.1)
+
+// Cooldown
+cooldown     = input.int(6,    "Bars Between Trades",         group="Filters")
+
+// Session
+useSession   = input.bool(true,"MCX Session Filter",          group="Session")
+sessStart    = input.int(920,  "Start HHMM",                  group="Session")
+sessEnd      = input.int(2300, "End HHMM",                    group="Session")
+
+// Direction
+tradeDir     = input.string("Both","Direction",
+     options=["Long Only","Short Only","Both"],                group="Filters")
+
+// ═══════════════════════════════════════════════════════
+// SESSION
+// ═══════════════════════════════════════════════════════
+hhmm      = hour * 100 + minute
+inSession = not useSession or (hhmm >= sessStart and hhmm <= sessEnd)
+
+// ═══════════════════════════════════════════════════════
+// KALMAN FILTER — 1D implementation
+// State: [price_estimate, velocity]
+// Recursively updates each bar — zero fixed lookback
+// Based on constant velocity model
+// ═══════════════════════════════════════════════════════
+var float kalmX  = close   // State estimate (fair value)
+var float kalmV  = 0.0     // Velocity (rate of change of fair value)
+var float kalmP  = 1.0     // Estimate error covariance
+
+// Predict
+kalmXp = kalmX + kalmV
+kalmPp = kalmP + kalmQ
+
+// Kalman Gain
+kalmK  = kalmPp / (kalmPp + kalmR)
+
+// Update
+kalmX := kalmXp + kalmK * (close - kalmXp)
+kalmV := kalmV  + kalmK * (close - kalmXp) * 0.1
+kalmP := (1 - kalmK) * kalmPp
+
+// ═══════════════════════════════════════════════════════
+// ATR-NORMALISED RESIDUAL
+// Residual = how far price is from Kalman fair value
+// Normalised by ATR so threshold is volatility-aware
+// ═══════════════════════════════════════════════════════
+atr       = ta.atr(atrLen)
+residual  = close - kalmX
+normResid = atr > 0 ? residual / atr : 0.0
+
+// ═══════════════════════════════════════════════════════
+// KALMAN VELOCITY FILTER
+// Smoothed absolute velocity of Kalman estimate
+// High velocity = Kalman tracking a trend = don't fade
+// ═══════════════════════════════════════════════════════
+kalmVelAbs    = math.abs(kalmV)
+kalmVelSmooth = ta.ema(kalmVelAbs, velLen)
+kalmVelNorm   = atr > 0 ? kalmVelSmooth / atr : 0.0
+velOK         = kalmVelNorm < maxVelMult     // Fair value not moving too fast
+
+// ═══════════════════════════════════════════════════════
+// VARIANCE RATIO — Hurst Exponent Proxy
+// VR = Var(n-period returns) / (n * Var(1-period returns))
+// VR < 1  →  mean-reverting (anti-persistent)
+// VR = 1  →  random walk
+// VR > 1  →  trending (persistent)
+// We only scalp mean-reversion when VR < vrThreshold
+// ═══════════════════════════════════════════════════════
+r1      = close - close[1]                     // 1-bar return
+rN      = close - close[vrLen]                 // N-bar return
+
+var1    = ta.variance(r1, vrLen)               // Variance of 1-bar returns
+varN    = ta.variance(rN, vrLen)               // Variance of N-bar returns
+
+// VR = varN / (vrLen * var1) — scaled so VR=1 is random walk
+vr      = (var1 > 0) ? varN / (vrLen * var1) : 1.0
+vrMR    = vr < vrThreshold                     // True = mean-reverting regime confirmed
+
+// ═══════════════════════════════════════════════════════
+// COOLDOWN
+// ═══════════════════════════════════════════════════════
+var int barsSince = cooldown + 1
+barsSince := strategy.position_size != 0 ? 0 : math.min(barsSince + 1, cooldown + 1)
+cooledDown = barsSince >= cooldown
+
+// ═══════════════════════════════════════════════════════
+// ENTRY CONDITIONS
+// Long:  Price below Kalman by entryThresh ATRs
+//        + regime is mean-reverting
+//        + Kalman velocity is low (not trending away)
+// Short: Mirror of above
+// ═══════════════════════════════════════════════════════
+longCond  = normResid < -entryThresh and vrMR and velOK and inSession and cooledDown
+shortCond = normResid >  entryThresh and vrMR and velOK and inSession and cooledDown
+
+goLong  = longCond  and (tradeDir == "Long Only"  or tradeDir == "Both")
+goShort = shortCond and (tradeDir == "Short Only" or tradeDir == "Both")
+
+// ═══════════════════════════════════════════════════════
+// EXIT CONDITIONS
+// Primary: residual reverts to within exitThresh of Kalman
+// Secondary: ATR trailing stop (protects against regime flip)
+// ═══════════════════════════════════════════════════════
+longExit  = normResid >= -exitThresh
+shortExit = normResid <=  exitThresh
+
+// ATR trail
+var float trailL = na
+var float trailS = na
+
+if strategy.position_size > 0
+    trailL := math.max(nz(trailL, low - atr * atrMult), close - atr * atrMult)
+if strategy.position_size < 0
+    trailS := math.min(nz(trailS, high + atr * atrMult), close + atr * atrMult)
+if strategy.position_size == 0
+    trailL := na
+    trailS := na
+
+// ═══════════════════════════════════════════════════════
+// EXECUTION
+// ═══════════════════════════════════════════════════════
+if goLong  and strategy.position_size == 0
+    strategy.entry("Long",  strategy.long)
+if goShort and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+
+if strategy.position_size > 0
+    strategy.exit("L-Trail", "Long",  stop=trailL)
+if strategy.position_size < 0
+    strategy.exit("S-Trail", "Short", stop=trailS)
+
+if strategy.position_size > 0  and longExit
+    strategy.close("Long",  comment="Revert")
+if strategy.position_size < 0 and shortExit
+    strategy.close("Short", comment="Revert")
+
+// ═══════════════════════════════════════════════════════
+// PLOTS — Indicator Panel
+// ═══════════════════════════════════════════════════════
+
+// Normalised residual (main signal)
+residCol = normResid >  entryThresh ? color.new(color.red,  10) :normResid < -entryThresh ? color.new(color.lime, 10) :color.new(color.gray, 50)
+
+plot(normResid,     "Norm Residual",  color=residCol, linewidth=2)
+
+// Variance Ratio — regime indicator
+vrCol = vr < vrThreshold ? color.new(color.aqua,  30) :vr > 1.0          ? color.new(color.orange,30) : color.new(color.gray, 50)
+plot(vr,            "Variance Ratio", color=vrCol,    linewidth=1)
+// Kalman velocity (normalised)
+plot(kalmVelNorm,   "Kalman Velocity",color=color.new(color.purple, 40), linewidth=1)
+
+// Reference lines
+hline( entryThresh, "Entry Short",   color=color.new(color.red,  30), linestyle=hline.style_solid)
+hline(-entryThresh, "Entry Long",    color=color.new(color.lime, 30), linestyle=hline.style_solid)
+hline( exitThresh,  "Exit Short",    color=color.new(color.red,  60), linestyle=hline.style_dashed)
+hline(-exitThresh,  "Exit Long",     color=color.new(color.lime, 60), linestyle=hline.style_dashed)
+hline(vrThreshold,  "VR Threshold",  color=color.new(color.aqua, 50), linestyle=hline.style_dotted)
+hline(1.0,          "VR=1 (RW)",     color=color.new(color.gray, 40), linestyle=hline.style_dotted)
+hline(0,            "Zero",          color=color.new(color.white,60), linestyle=hline.style_solid)
+
+// Entry markers
+plotshape(goLong,  "Long",  shape.labelup,   location.absolute, color.lime, size=size.small, text="L", textcolor=color.black)
+plotshape(goShort, "Short", shape.labeldown, location.absolute, color.red,  size=size.small, text="S", textcolor=color.white)
+
+// Background — regime coloring
+bgcolor(vrMR and velOK ? color.new(color.aqua, 94) : color.new(color.orange, 94),
+     title="Regime BG (Aqua=MR, Orange=Trend)")
