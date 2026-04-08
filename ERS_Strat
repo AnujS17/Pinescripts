@@ -1,0 +1,541 @@
+// ══════════════════════════════════════════════════════════════════════════════
+//  SILVERMIC · Expansion Regime Swing  [ERS v2.0]
+//  Optimised for MCX SILVERMIC — 15-min chart (also works on 4H / Daily)
+//
+//  WHAT CHANGED FROM v1 (profit-giveback fix):
+//  ─────────────────────────────────────────────────────────────────────────
+//  PROBLEM : Single static 2.5×ATR trail gave back too much from peak,
+//            because it was sized for full-swing protection from bar 1.
+//
+//  SOLUTION — Three-layer exit architecture:
+//
+//  1. TIERED PROGRESSIVE TRAIL (core fix)
+//     Stage 1  [0 → +2R]      : Trail = 2.0×ATR  (wide — let trade breathe)
+//     Stage 2  [+2R → +3R]    : Trail = 1.2×ATR  (tighter — protect gains)
+//     Stage 3  [> +3R]        : Trail = 0.8×ATR  (tight — ride near peak)
+//     The trail never moves against you — it only ratchets in trade direction.
+//
+//  2. PARTIAL EXIT AT +2R (Stage 2 trigger)
+//     Close 50% of position when unrealised P&L first reaches 2×ATR.
+//     Locks half the trade as cash; remainder runs with the tight Stage 2/3 trail.
+//     This alone eliminates the "turned a 4R winner into a 1R winner" scenario.
+//
+//  3. MOMENTUM EXHAUSTION EXIT (early full exit)
+//     Detects when the move is running out of steam BEFORE price pulls back:
+//       - MACD histogram has declined for N consecutive bars from its peak
+//       - RSI shows bearish/bullish divergence (price makes new high, RSI doesn't)
+//     Closes remaining position on exhaustion signal rather than waiting for
+//     the trail to be hit.
+//
+//  PARAMETER CHANGES FOR 15-MIN:
+//     ATR len 14→10, ATR base 50→30, Swing lookback 20→12, LR len 20→14
+//     Stage multipliers calibrated on 15-min silver volatility
+// ══════════════════════════════════════════════════════════════════════════════
+
+//@version=5
+strategy("SILVERMIC · ERS v2 [Tiered Trail]",
+     shorttitle              = "SILVERMIC·ERS·v2",
+     overlay                 = true,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 5,
+     slippage                = 2,
+     calc_on_every_tick      = false,
+     process_orders_on_close = true)
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_r = "⚙ Regime Detection"
+adx_len        = input.int   (14,   "ADX Length",              group=grp_r, minval=5)
+adx_thresh     = input.float (22.0, "ADX Threshold",           group=grp_r, step=0.5)
+atr_len        = input.int   (10,   "ATR Length",              group=grp_r, minval=3,
+                              tooltip="Shorter (10) for 15-min; use 14 for 4H/Daily")
+atr_base_len   = input.int   (30,   "ATR Baseline MA Length",  group=grp_r,
+                              tooltip="30 for 15-min; 50 for 4H/Daily")
+atr_exp_thresh = input.float (1.10, "ATR Expansion Ratio",     group=grp_r, step=0.05)
+bb_len         = input.int   (20,   "BB Length",               group=grp_r)
+bb_mult        = input.float (2.0,  "BB Multiplier",           group=grp_r, step=0.1)
+bb_base_len    = input.int   (30,   "BB Width Baseline MA",    group=grp_r)
+
+grp_t = "📈 Trend Filter"
+ema_fast       = input.int   (21,   "Fast EMA",                group=grp_t)
+ema_mid        = input.int   (50,   "Mid EMA",                 group=grp_t)
+ema_slow       = input.int   (200,  "Slow EMA",                group=grp_t)
+lr_len         = input.int   (14,   "LR Slope Length",         group=grp_t,
+                              tooltip="14 for 15-min; 20 for 4H/Daily")
+lr_thresh      = input.float (0.10, "Norm. LR Slope Min",      group=grp_t, step=0.01)
+
+grp_e = "🎯 Entry"
+swing_lb       = input.int   (12,   "Swing High/Low Lookback", group=grp_e,
+                              tooltip="12 bars suits 15-min; 20 for 4H/Daily")
+rsi_len        = input.int   (14,   "RSI Length",              group=grp_e)
+min_score      = input.int   (3,    "Min Regime Score (0–5)",  group=grp_e, minval=1, maxval=5)
+use_breakout   = input.bool  (true, "Enable Breakout Entries", group=grp_e)
+use_pullback   = input.bool  (true, "Enable Pullback Entries", group=grp_e)
+use_shorts     = input.bool  (true, "Enable Short Trades",     group=grp_e)
+
+grp_x = "🛡 Exit & Risk Management"
+sl_mult        = input.float (1.5,  "Initial SL (× ATR)",     group=grp_x, step=0.1,
+                              tooltip="Hard stop on entry bar. Defines 1R.")
+
+// ── Tiered trail multipliers ─────────────────────────────────────────────────
+trail_s1       = input.float (2.0,  "Stage 1 Trail (× ATR)  [0 → +2R]",  group=grp_x, step=0.1,
+                              tooltip="Wide trail when trade just entered. Gives room for normal pullbacks.")
+trail_s2       = input.float (1.2,  "Stage 2 Trail (× ATR)  [+2R → +3R]",group=grp_x, step=0.1,
+                              tooltip="Tightens once +2R is achieved. Locks in most of Stage 1 gains.")
+trail_s3       = input.float (0.8,  "Stage 3 Trail (× ATR)  [> +3R]",    group=grp_x, step=0.1,
+                              tooltip="Very tight near peak. Minimises giveback on a strong extended move.")
+
+tp_mult        = input.float (4.0,  "Full TP (× ATR)",        group=grp_x, step=0.25,
+                              tooltip="Remaining 50% closes here if trail not triggered first")
+partial_pct    = input.float (50.0, "Partial Exit % at +2R",  group=grp_x, step=5.0,
+                              tooltip="Percentage of position closed when profit first reaches 2×ATR (Stage 2 trigger)")
+
+// ── Momentum exhaustion parameters ───────────────────────────────────────────
+exh_macd_bars  = input.int   (3,    "MACD Hist Declining Bars",group=grp_x, minval=1,
+                              tooltip="Exit early if MACD histogram has been declining this many bars from its peak")
+exh_rsi_div    = input.bool  (true, "Use RSI Divergence Filter",group=grp_x,
+                              tooltip="Requires RSI divergence alongside MACD decay for exhaustion signal")
+exh_rsi_lb     = input.int   (5,    "RSI Divergence Lookback", group=grp_x,
+                              tooltip="Compare current RSI peak/trough against N bars ago for divergence")
+
+regime_exit_min= input.int   (2,    "Exit if Score drops <",  group=grp_x, minval=0, maxval=5)
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  CORE CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+atr_val        = ta.atr(atr_len)
+atr_base       = ta.sma(atr_val, atr_base_len)
+atr_ratio      = atr_val / atr_base
+
+[diplus, diminus, adx_val] = ta.dmi(adx_len, adx_len)
+di_bull        = diplus  > diminus
+di_bear        = diminus > diplus
+
+[bb_mid, bb_upper, bb_lower] = ta.bb(close, bb_len, bb_mult)
+bb_width       = (bb_upper - bb_lower) / bb_mid
+bb_width_avg   = ta.sma(bb_width, bb_base_len)
+
+ema21          = ta.ema(close, ema_fast)
+ema50          = ta.ema(close, ema_mid)
+ema200         = ta.ema(close, ema_slow)
+
+[macd_line, macd_sig, macd_hist] = ta.macd(close, 12, 26, 9)
+rsi_val        = ta.rsi(close, rsi_len)
+
+lr_slope_raw   = ta.linreg(close, lr_len, 0) - ta.linreg(close, lr_len, 1)
+lr_slope_norm  = lr_slope_raw / atr_val
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  REGIME SCORE
+// ══════════════════════════════════════════════════════════════════════════════
+
+adx_ok         = adx_val   > adx_thresh
+atr_exp_ok     = atr_ratio >= atr_exp_thresh
+bb_exp_ok      = bb_width  > bb_width_avg
+ema_bull_ok    = ema21 > ema50 and ema50 > ema200
+ema_bear_ok    = ema21 < ema50 and ema50 < ema200
+lr_bull_ok     = lr_slope_norm >  lr_thresh
+lr_bear_ok     = lr_slope_norm < -lr_thresh
+
+score_bull     = (adx_ok?1:0) + (atr_exp_ok?1:0) + (bb_exp_ok?1:0) + (ema_bull_ok?1:0) + (lr_bull_ok?1:0)
+score_bear     = (adx_ok?1:0) + (atr_exp_ok?1:0) + (bb_exp_ok?1:0) + (ema_bear_ok?1:0) + (lr_bear_ok?1:0)
+
+is_bull_exp    = score_bull >= min_score and di_bull
+is_bear_exp    = score_bear >= min_score and di_bear and use_shorts
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  MOMENTUM EXHAUSTION DETECTOR
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//  Fires when the move is running out of steam — triggered BEFORE price
+//  reverses, so exits are closer to the peak than waiting for the trail.
+//
+//  Long exhaustion:
+//    - MACD histogram was positive but has been declining for N bars
+//    - (optional) Price made a new N-bar high but RSI did NOT (RSI divergence)
+//
+//  Short exhaustion: mirror conditions
+
+// Track MACD histogram peak over a short rolling window
+macd_hist_peak  = ta.highest(macd_hist, exh_macd_bars + 1)
+macd_hist_trough= ta.lowest (macd_hist, exh_macd_bars + 1)
+
+// MACD histogram declining: was above 0 recently, now falling N bars straight
+macd_decay_long  = macd_hist < macd_hist[1] and macd_hist[1] < macd_hist[2] and
+                   (exh_macd_bars <= 2 or macd_hist[2] < macd_hist[3]) and
+                   macd_hist_peak > 0
+
+macd_decay_short = macd_hist > macd_hist[1] and macd_hist[1] > macd_hist[2] and
+                   (exh_macd_bars <= 2 or macd_hist[2] > macd_hist[3]) and
+                   macd_hist_trough < 0
+
+// RSI divergence: price makes new swing extreme but RSI does not confirm
+price_hi_now    = close >= ta.highest(close, exh_rsi_lb)   // price at N-bar high
+rsi_hi_now      = rsi_val >= ta.highest(rsi_val, exh_rsi_lb) // RSI at N-bar high
+rsi_div_bear    = price_hi_now and not rsi_hi_now            // bearish divergence: price high, RSI not
+
+price_lo_now    = close <= ta.lowest(close, exh_rsi_lb)
+rsi_lo_now      = rsi_val <= ta.lowest(rsi_val, exh_rsi_lb)
+rsi_div_bull    = price_lo_now and not rsi_lo_now            // bullish divergence: price low, RSI not
+
+// Final exhaustion flags
+exhaust_long  = macd_decay_long  and (not exh_rsi_div or rsi_div_bear)
+exhaust_short = macd_decay_short and (not exh_rsi_div or rsi_div_bull)
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ENTRY SIGNALS
+// ══════════════════════════════════════════════════════════════════════════════
+
+swing_hi = ta.highest(high, swing_lb)[1]
+swing_lo = ta.lowest (low,  swing_lb)[1]
+
+long_bo  = use_breakout and is_bull_exp and close > swing_hi and
+           macd_line > macd_sig and rsi_val > 45 and rsi_val < 78
+
+short_bo = use_breakout and is_bear_exp and close < swing_lo and
+           macd_line < macd_sig and rsi_val < 55 and rsi_val > 22
+
+long_pb  = use_pullback and is_bull_exp and
+           close > ema21 and low[1] <= ema21 * 1.003 and
+           close > open  and rsi_val > 38 and rsi_val < 70
+
+short_pb = use_pullback and is_bear_exp and
+           close < ema21 and high[1] >= ema21 * 0.997 and
+           close < open  and rsi_val < 62 and rsi_val > 30
+
+long_entry  = (long_bo  or long_pb)  and strategy.position_size == 0
+short_entry = (short_bo or short_pb) and strategy.position_size == 0
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  POSITION STATE VARIABLES
+// ══════════════════════════════════════════════════════════════════════════════
+
+var float entry_price   = na   // Price at which trade was opened
+var float entry_atr     = na   // ATR value frozen at entry (used for stage thresholds)
+
+var float hard_sl       = na   // Initial hard stop (never moves)
+var float trail_stop    = na   // Active trailing stop (ratchets in trade direction)
+var float full_tp       = na   // Full take-profit target (remaining position)
+
+var int   trail_stage   = 0    // Current trailing stage (1, 2, or 3)
+var bool  partial_done  = false // Whether the 50% partial exit has been executed
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  TRADE EXECUTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ─── Long Entry ──────────────────────────────────────────────────────────────
+if long_entry
+    entry_price   := close
+    entry_atr     := atr_val
+    hard_sl       := close - sl_mult   * atr_val
+    trail_stop    := close - trail_s1  * atr_val   // Start at Stage 1 width
+    full_tp       := close + tp_mult   * atr_val
+    trail_stage   := 1
+    partial_done  := false
+    strategy.entry("Long", strategy.long,
+                   comment = long_bo ? "L_BO" : "L_PB")
+
+// ─── Short Entry ─────────────────────────────────────────────────────────────
+if short_entry
+    entry_price   := close
+    entry_atr     := atr_val
+    hard_sl       := close + sl_mult   * atr_val
+    trail_stop    := close + trail_s1  * atr_val
+    full_tp       := close - tp_mult   * atr_val
+    trail_stage   := 1
+    partial_done  := false
+    strategy.entry("Short", strategy.short,
+                   comment = short_bo ? "S_BO" : "S_PB")
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  PROGRESSIVE TRAIL MANAGEMENT  (runs every bar while in trade)
+// ══════════════════════════════════════════════════════════════════════════════
+
+if strategy.position_size > 0 and not na(entry_price)
+
+    // ── Unrealised profit in ATR units (R-multiples using entry ATR) ────────
+    unrealised_r = (close - entry_price) / entry_atr
+
+    // ── Stage promotion ─────────────────────────────────────────────────────
+    if unrealised_r >= 3.0
+        trail_stage := 3
+    else if unrealised_r >= 2.0
+        trail_stage := 2
+    else
+        trail_stage := 1
+
+    // ── Active trail width based on current stage ────────────────────────────
+    active_mult = trail_stage == 3 ? trail_s3 :
+                  trail_stage == 2 ? trail_s2 : trail_s1
+
+    // ── New candidate stop: today's close minus active width ─────────────────
+    candidate = close - active_mult * atr_val
+
+    // ── Ratchet: only move stop UP, never down ───────────────────────────────
+    trail_stop := math.max(nz(trail_stop, hard_sl), candidate)
+
+    // ── Hard floor: stop can never fall below the initial SL ────────────────
+    trail_stop := math.max(trail_stop, hard_sl)
+
+    // ── PARTIAL EXIT: 50% at +2R (fires once) ────────────────────────────────
+    if unrealised_r >= 2.0 and not partial_done
+        partial_done := true
+        partial_size = math.floor(strategy.position_size * (partial_pct / 100))
+        if partial_size > 0
+            strategy.close("Long", qty=partial_size, comment="Partial +2R")
+
+    // ── Apply trailing stop exit for remaining position ───────────────────────
+    strategy.exit("Long Exit", "Long",
+                  stop    = trail_stop,
+                  limit   = full_tp,
+                  comment = "LX_T" + str.tostring(trail_stage))
+
+
+if strategy.position_size < 0 and not na(entry_price)
+
+    unrealised_r = (entry_price - close) / entry_atr
+
+    if unrealised_r >= 3.0
+        trail_stage := 3
+    else if unrealised_r >= 2.0
+        trail_stage := 2
+    else
+        trail_stage := 1
+
+    active_mult = trail_stage == 3 ? trail_s3 :
+                  trail_stage == 2 ? trail_s2 : trail_s1
+
+    candidate   = close + active_mult * atr_val
+
+    trail_stop  := math.min(nz(trail_stop, hard_sl), candidate)
+    trail_stop  := math.min(trail_stop, hard_sl)
+
+    if unrealised_r >= 2.0 and not partial_done
+        partial_done := true
+        partial_size = math.floor(math.abs(strategy.position_size) * (partial_pct / 100))
+        if partial_size > 0
+            strategy.close("Short", qty=partial_size, comment="Partial +2R")
+
+    strategy.exit("Short Exit", "Short",
+                  stop    = trail_stop,
+                  limit   = full_tp,
+                  comment = "SX_T" + str.tostring(trail_stage))
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  MOMENTUM EXHAUSTION EXIT  (early full exit, overrides trail)
+// ══════════════════════════════════════════════════════════════════════════════
+
+if strategy.position_size > 0 and exhaust_long
+    strategy.close("Long",  comment = "Exhaustion Exit")
+
+if strategy.position_size < 0 and exhaust_short
+    strategy.close("Short", comment = "Exhaustion Exit")
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  REGIME COLLAPSE EXIT
+// ══════════════════════════════════════════════════════════════════════════════
+
+if strategy.position_size > 0 and score_bull < regime_exit_min
+    strategy.close("Long",  comment = "Regime Collapse")
+
+if strategy.position_size < 0 and score_bear < regime_exit_min
+    strategy.close("Short", comment = "Regime Collapse")
+
+
+// ── Reset state when flat ─────────────────────────────────────────────────────
+if strategy.position_size == 0
+    entry_price  := na
+    entry_atr    := na
+    hard_sl      := na
+    trail_stop   := na
+    full_tp      := na
+    trail_stage  := 0
+    partial_done := false
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  VISUALS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ─── EMAs ────────────────────────────────────────────────────────────────────
+plot(ema21,  "EMA 21",  color=color.new(color.yellow, 0),  linewidth=1)
+plot(ema50,  "EMA 50",  color=color.new(color.orange, 0),  linewidth=2)
+plot(ema200, "EMA 200", color=color.new(color.red,    0),  linewidth=2)
+
+// ─── Bollinger Bands ─────────────────────────────────────────────────────────
+p_upper = plot(bb_upper, "BB Upper", color=color.new(color.gray, 72), linewidth=1)
+p_lower = plot(bb_lower, "BB Lower", color=color.new(color.gray, 72), linewidth=1)
+fill(p_upper, p_lower, color=color.new(color.gray, 92))
+
+// ─── Swing reference ─────────────────────────────────────────────────────────
+plot(swing_hi, "Swing Hi", color=color.new(color.aqua,   65), style=plot.style_circles, linewidth=1)
+plot(swing_lo, "Swing Lo", color=color.new(color.purple, 65), style=plot.style_circles, linewidth=1)
+
+// ─── Regime background ───────────────────────────────────────────────────────
+bgcolor(is_bull_exp ? color.new(color.lime, 91) : na, title="Bull Expansion BG")
+bgcolor(is_bear_exp ? color.new(color.red,  91) : na, title="Bear Expansion BG")
+
+// ─── Entry arrows ────────────────────────────────────────────────────────────
+plotshape(long_entry,  "Long Signal",  shape.triangleup,   location.belowbar,
+          color.new(color.lime, 0), size=size.normal, text="BUY")
+plotshape(short_entry, "Short Signal", shape.triangledown, location.abovebar,
+          color.new(color.red,  0), size=size.normal, text="SELL")
+
+// ─── Exhaustion markers ───────────────────────────────────────────────────────
+plotshape(strategy.position_size > 0 and exhaust_long,  "Exhaust Long",  shape.xcross,
+          location.abovebar, color.new(color.orange, 0), size=size.small, text="EXH")
+plotshape(strategy.position_size < 0 and exhaust_short, "Exhaust Short", shape.xcross,
+          location.belowbar, color.new(color.orange, 0), size=size.small, text="EXH")
+
+// ─── Trailing stop (colour changes with stage) ───────────────────────────────
+trail_col = trail_stage == 3 ? color.new(color.teal,  10) :
+            trail_stage == 2 ? color.new(color.lime,  20) :
+                               color.new(color.gray,  30)
+plot(strategy.position_size > 0 ? trail_stop : na,
+     "Long Trail",  color=trail_col, linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? trail_stop : na,
+     "Short Trail", color=trail_col, linewidth=2, style=plot.style_linebr)
+
+// ─── Full TP level ───────────────────────────────────────────────────────────
+plot(strategy.position_size > 0 ? full_tp : na,
+     "Long TP",  color=color.new(color.teal,   35), linewidth=1, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? full_tp : na,
+     "Short TP", color=color.new(color.orange, 35), linewidth=1, style=plot.style_linebr)
+
+// ─── Hard SL line ────────────────────────────────────────────────────────────
+plot(strategy.position_size != 0 ? hard_sl : na,
+     "Hard SL", color=color.new(color.red, 40), linewidth=1,
+     style=plot.style_linebr)
+
+// ─── Stage zone labels (last bar only) ───────────────────────────────────────
+barcolor(trail_stage == 3 and strategy.position_size != 0 ? color.new(color.teal, 20) :
+         trail_stage == 2 and strategy.position_size != 0 ? color.new(color.lime, 30) : na,
+         title="Trail Stage Bar Color")
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  DASHBOARD TABLE
+// ══════════════════════════════════════════════════════════════════════════════
+
+var table dash = table.new(position.top_right, 2, 14,
+     bgcolor=color.new(color.black, 70), border_width=1,
+     border_color=color.new(color.gray, 55), frame_width=1,
+     frame_color=color.new(color.gray, 45))
+
+if barstate.islast
+    reg_str  = is_bull_exp ? "BULL EXPANSION" : is_bear_exp ? "BEAR EXPANSION" : "NO REGIME"
+    reg_col  = is_bull_exp ? color.lime : is_bear_exp ? color.red : color.gray
+
+    pos_str  = strategy.position_size > 0 ? "LONG  ▲" :
+               strategy.position_size < 0 ? "SHORT ▼" : "FLAT"
+    pos_col  = strategy.position_size > 0 ? color.lime :
+               strategy.position_size < 0 ? color.red  : color.gray
+
+    stage_str = trail_stage == 3 ? "Stage 3 — TIGHT (0.8x)" :
+                trail_stage == 2 ? "Stage 2 — LOCK  (1.2x)" :
+                trail_stage == 1 ? "Stage 1 — WIDE  (2.0x)" : "—"
+    stage_col = trail_stage == 3 ? color.teal :
+                trail_stage == 2 ? color.lime  :
+                trail_stage == 1 ? color.gray  : color.gray
+
+    unrealised_r_disp = not na(entry_price) and entry_atr > 0 ?
+         (strategy.position_size > 0 ?
+              math.round((close - entry_price) / entry_atr, 2) :
+              math.round((entry_price - close) / entry_atr, 2)) : 0.0
+
+    table.cell(dash, 0, 0,  "SILVERMIC · ERS v2", text_color=color.white,
+               bgcolor=color.new(color.navy, 25), text_size=size.small)
+    table.cell(dash, 1, 0,  "15-min",             text_color=color.gray,
+               bgcolor=color.new(color.navy, 25), text_size=size.small)
+
+    table.cell(dash, 0, 1,  "Regime",             text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 1,  reg_str,              text_color=reg_col,      text_size=size.small)
+
+    table.cell(dash, 0, 2,  "Bull Score",         text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 2,  str.tostring(score_bull) + " / 5",
+               text_color=score_bull >= min_score ? color.lime : color.new(color.gray,20),
+               text_size=size.small)
+
+    table.cell(dash, 0, 3,  "Bear Score",         text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 3,  str.tostring(score_bear) + " / 5",
+               text_color=score_bear >= min_score ? color.red  : color.new(color.gray,20),
+               text_size=size.small)
+
+    table.cell(dash, 0, 4,  "ADX",                text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 4,  str.tostring(math.round(adx_val,1)),
+               text_color=adx_ok ? color.lime : color.new(color.gray,25), text_size=size.small)
+
+    table.cell(dash, 0, 5,  "ATR Ratio",          text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 5,  str.tostring(math.round(atr_ratio,3)),
+               text_color=atr_exp_ok ? color.lime : color.new(color.gray,25), text_size=size.small)
+
+    table.cell(dash, 0, 6,  "BB Width %",         text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 6,  str.tostring(math.round(bb_width*100,2)) + "%",
+               text_color=bb_exp_ok ? color.lime : color.new(color.gray,25), text_size=size.small)
+
+    table.cell(dash, 0, 7,  "LR Slope",           text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 7,  str.tostring(math.round(lr_slope_norm,3)),
+               text_color=(lr_bull_ok or lr_bear_ok) ? color.lime : color.new(color.gray,25),
+               text_size=size.small)
+
+    table.cell(dash, 0, 8,  "RSI",                text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 8,  str.tostring(math.round(rsi_val,1)),
+               text_color=color.white, text_size=size.small)
+
+    table.cell(dash, 0, 9,  "Position",           text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 9,  pos_str,              text_color=pos_col,      text_size=size.small)
+
+    table.cell(dash, 0, 10, "Trail Stage",        text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 10, stage_str,            text_color=stage_col,    text_size=size.small)
+
+    table.cell(dash, 0, 11, "Unrealised R",       text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 11, str.tostring(unrealised_r_disp) + " R",
+               text_color = unrealised_r_disp >= 2 ? color.lime :
+                            unrealised_r_disp >= 0 ? color.yellow : color.red,
+               text_size=size.small)
+
+    table.cell(dash, 0, 12, "Partial Done",       text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 12, partial_done ? "Yes — 50% closed" : "No",
+               text_color=partial_done ? color.teal : color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 13, "Exhaustion",         text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 13,
+               (strategy.position_size > 0 and exhaust_long) or
+               (strategy.position_size < 0 and exhaust_short) ? "FIRING" : "—",
+               text_color=color.orange, text_size=size.small)
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(long_entry,  "ERS v2 Long Entry",    "SILVERMIC ERS v2: LONG")
+alertcondition(short_entry, "ERS v2 Short Entry",   "SILVERMIC ERS v2: SHORT")
+alertcondition(strategy.position_size > 0 and exhaust_long,
+               "ERS v2 Long Exhaustion",  "SILVERMIC ERS v2: Long exhaustion — watch for exit")
+alertcondition(strategy.position_size < 0 and exhaust_short,
+               "ERS v2 Short Exhaustion", "SILVERMIC ERS v2: Short exhaustion — watch for exit")
+alertcondition(strategy.position_size > 0 and score_bull < regime_exit_min,
+               "ERS v2 Regime Exit Long",  "SILVERMIC ERS v2: Bull regime collapsed")
+alertcondition(strategy.position_size < 0 and score_bear < regime_exit_min,
+               "ERS v2 Regime Exit Short", "SILVERMIC ERS v2: Bear regime collapsed")
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  END
+// ══════════════════════════════════════════════════════════════════════════════
