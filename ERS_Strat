@@ -404,9 +404,7 @@ plotshape(strategy.position_size < 0 and exhaust_short, "Exhaust Short", shape.x
           location.belowbar, color.new(color.orange, 0), size=size.small, text="EXH")
 
 // ─── Trailing stop (colour changes with stage) ───────────────────────────────
-trail_col = trail_stage == 3 ? color.new(color.teal,  10) :
-            trail_stage == 2 ? color.new(color.lime,  20) :
-                               color.new(color.gray,  30)
+trail_col = trail_stage == 3 ? color.new(color.teal,  10) :            trail_stage == 2 ? color.new(color.lime,  20) :                               color.new(color.gray,  30)
 plot(strategy.position_size > 0 ? trail_stop : na,
      "Long Trail",  color=trail_col, linewidth=2, style=plot.style_linebr)
 plot(strategy.position_size < 0 ? trail_stop : na,
@@ -447,12 +445,8 @@ if barstate.islast
     pos_col  = strategy.position_size > 0 ? color.lime :
                strategy.position_size < 0 ? color.red  : color.gray
 
-    stage_str = trail_stage == 3 ? "Stage 3 — TIGHT (0.8x)" :
-                trail_stage == 2 ? "Stage 2 — LOCK  (1.2x)" :
-                trail_stage == 1 ? "Stage 1 — WIDE  (2.0x)" : "—"
-    stage_col = trail_stage == 3 ? color.teal :
-                trail_stage == 2 ? color.lime  :
-                trail_stage == 1 ? color.gray  : color.gray
+    stage_str = trail_stage == 3 ? "Stage 3 — TIGHT (0.8x)" :                trail_stage == 2 ? "Stage 2 — LOCK  (1.2x)" : trail_stage == 1 ? "Stage 1 — WIDE  (2.0x)" : "—"
+    stage_col = trail_stage == 3 ? color.teal :                trail_stage == 2 ? color.lime  : trail_stage == 1 ? color.gray  : color.gray
 
     unrealised_r_disp = not na(entry_price) and entry_atr > 0 ?
          (strategy.position_size > 0 ?
@@ -505,10 +499,7 @@ if barstate.islast
     table.cell(dash, 1, 10, stage_str,            text_color=stage_col,    text_size=size.small)
 
     table.cell(dash, 0, 11, "Unrealised R",       text_color=color.silver, text_size=size.small)
-    table.cell(dash, 1, 11, str.tostring(unrealised_r_disp) + " R",
-               text_color = unrealised_r_disp >= 2 ? color.lime :
-                            unrealised_r_disp >= 0 ? color.yellow : color.red,
-               text_size=size.small)
+    table.cell(dash, 1, 11, str.tostring(unrealised_r_disp) + " R",               text_color = unrealised_r_disp >= 2 ? color.lime :                            unrealised_r_disp >= 0 ? color.yellow : color.red,               text_size=size.small)
 
     table.cell(dash, 0, 12, "Partial Done",       text_color=color.silver, text_size=size.small)
     table.cell(dash, 1, 12, partial_done ? "Yes — 50% closed" : "No",
