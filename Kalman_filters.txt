@@ -1,5 +1,5 @@
 //@version=5
-strategy("Kalman Adaptive Scalper v2 — MCX Silver Micro [Upgraded]",
+strategy("Kalman Adaptive Scalper v1.4 — MCX Silver Micro",
      overlay=false,
      default_qty_type=strategy.percent_of_equity,
      default_qty_value=2,
@@ -9,67 +9,50 @@ strategy("Kalman Adaptive Scalper v2 — MCX Silver Micro [Upgraded]",
      process_orders_on_close=true)
 
 // ═══════════════════════════════════════════════════════
-// ORIGINAL INPUTS (unchanged)
+// INPUTS
 // ═══════════════════════════════════════════════════════
-kalmQ        = input.float(0.013, "Kalman Process Noise (Q)",     group="Kalman Filter", step=0.001)
-kalmR        = input.float(1.1,   "Kalman Measurement Noise (R)", group="Kalman Filter", step=0.1)
 
-entryThresh  = input.float(2.1,   "Entry Threshold (ATR mult)",   group="Entry", step=0.1)
-exitThresh   = input.float(0.4,   "Exit Threshold (ATR mult)",    group="Entry", step=0.1)
+// Kalman Filter
+kalmQ   = input.float(0.004, "Kalman Process Noise (Q)",      group="Kalman Filter", step=0.001)
+kalmR   = input.float(1.3,   "Kalman Measurement Noise (R)",  group="Kalman Filter", step=0.1)
 
-vrLen        = input.int  (36,    "Variance Ratio Lookback",      group="Regime Filter")
-vrThreshold  = input.float(0.7,   "Max Variance Ratio (VR<1=MR)", group="Regime Filter", step=0.05)
+// Entry
+entryThresh  = input.float(1.8, "Entry Threshold (ATR multiples)", group="Entry", step=0.1)
+exitThresh   = input.float(0.3, "Exit Threshold (ATR multiples)",  group="Entry", step=0.1)
 
-velLen       = input.int  (9,     "Velocity Smoothing",           group="Velocity Filter")
-maxVelMult   = input.float(0.9,   "Max Velocity (ATR mult)",      group="Velocity Filter", step=0.1)
+// OU Half-Life Gate
+ouLen       = input.int(19,  "OU Fit Window (bars)",      group="OU Gate")
+maxHalfLife = input.int(90,  "Max Half-Life (bars)",      group="OU Gate")
+useOuGate   = input.bool(true,"Enable OU Gate",           group="OU Gate")
 
-atrLen       = input.int  (13,    "ATR Length",                   group="ATR")
-atrMult      = input.float(2.2,   "ATR Trail Stop Mult",          group="ATR", step=0.1)
+// GAP CIRCUIT BREAKER — NEW
+useGapBreaker = input.bool(true, "Enable Gap Breaker",          group="Gap Breaker")
+gapThresh     = input.float(1.5, "Opening Gap Threshold (ATR)", group="Gap Breaker", step=0.1,
+     tooltip="If |open - prev close| exceeds this × ATR, trigger lockout. 1.5 catches news-driven gaps, lower=more sensitive.")
+rangeThresh   = input.float(2.5, "Bar Range Threshold (ATR)",   group="Gap Breaker", step=0.1,
+     tooltip="If bar high-low range exceeds this × ATR, trigger lockout. Catches intrabar news spikes. 2.5 typical.")
+lockoutBars   = input.int(20,   "Lockout Period (bars)",        group="Gap Breaker",
+     tooltip="Bars to disable entries after gap detection. 20 on 5m = 100 min for Kalman to catch up and volatility to settle.")
 
-cooldown     = input.int  (6,     "Bars Between Trades",          group="Filters")
+// Regime filter — Variance Ratio
+vrLen        = input.int(36,   "Variance Ratio Lookback",     group="Regime Filter")
+vrThreshold  = input.float(0.7,"Max Variance Ratio (VR<1=MR)",group="Regime Filter", step=0.05)
 
-useSession   = input.bool (true,  "MCX Session Filter",           group="Session")
-sessStart    = input.int  (920,   "Start HHMM",                   group="Session")
-sessEnd      = input.int  (2300,  "End HHMM",                     group="Session")
+// Velocity filter
+velLen       = input.int(9,    "Velocity Smoothing",          group="Velocity Filter")
+maxVelMult   = input.float(0.9,"Max Velocity (ATR multiples)",group="Velocity Filter", step=0.1)
 
+// ATR
+atrLen       = input.int(13,   "ATR Length",                  group="ATR")
+atrMult      = input.float(2.2,"ATR Trail Stop Multiplier",   group="ATR", step=0.1)
+
+// Cooldown / Session / Direction
+cooldown     = input.int(6,    "Bars Between Trades",         group="Filters")
+useSession   = input.bool(true,"MCX Session Filter",          group="Session")
+sessStart    = input.int(920,  "Start HHMM",                  group="Session")
+sessEnd      = input.int(2300, "End HHMM",                    group="Session")
 tradeDir     = input.string("Both","Direction",
-     options=["Long Only","Short Only","Both"],                   group="Filters")
-
-// ═══════════════════════════════════════════════════════
-// ✨ NEW: TREND VETO (ERS-inspired)
-// ═══════════════════════════════════════════════════════
-useTrendVeto   = input.bool (true,  "Enable Trend Veto",               group="✨ Trend Veto",
-     tooltip="Blocks MR entries when ADX + EMA stack both say market is trending. Directly addresses the failure mode where VR misses micro-trends.")
-adxLenK        = input.int  (14,    "ADX Length",                      group="✨ Trend Veto")
-adxTrendThresh = input.float(22.0,  "ADX Trend Threshold",             group="✨ Trend Veto", step=0.5)
-emaFastTV      = input.int  (21,    "Fast EMA",                        group="✨ Trend Veto")
-emaMidTV       = input.int  (50,    "Mid EMA",                         group="✨ Trend Veto")
-emaSlowTV      = input.int  (200,   "Slow EMA",                        group="✨ Trend Veto")
-
-// ═══════════════════════════════════════════════════════
-// ✨ NEW: ENTRY QUALITY FILTERS
-// ═══════════════════════════════════════════════════════
-useResidPctile = input.bool (true,  "Require Extreme Residual",        group="✨ Entry Quality",
-     tooltip="|normResid| must sit in upper tail of its rolling distribution — adapts to regime noise level.")
-residLookback  = input.int  (200,   "Residual History Lookback",       group="✨ Entry Quality")
-residPctile    = input.float(85.0,  "Min Residual Percentile",         group="✨ Entry Quality", step=1.0)
-
-useVelAlignVeto = input.bool(true,  "Veto on Kalman Velocity Alignment", group="✨ Entry Quality",
-     tooltip="Blocks entry when Kalman drift is accelerating the same way as the residual — the classic fading-a-breakthrough loss pattern.")
-
-// ═══════════════════════════════════════════════════════
-// ✨ NEW: TIME STOP + MFE GATE
-// ═══════════════════════════════════════════════════════
-useTimeStop    = input.bool (true,  "Enable Time Stop",                group="✨ Exits")
-maxBarsInTrade = input.int  (25,    "Max Bars in Trade",               group="✨ Exits")
-minMfeAtr      = input.float(0.4,   "Min MFE for Survival (ATR mult)", group="✨ Exits", step=0.05,
-     tooltip="After maxBars, exit unless trade achieved at least this much favorable excursion. Kills stalled MR trades early.")
-
-// ═══════════════════════════════════════════════════════
-// ✨ NEW: ASYMMETRIC COOLDOWN
-// ═══════════════════════════════════════════════════════
-useLossCooldown  = input.bool (true, "Extend Cooldown After Loss",     group="✨ Cooldown")
-lossCooldownMult = input.float(2.5,  "Loss Cooldown Multiplier",       group="✨ Cooldown", step=0.1)
+     options=["Long Only","Short Only","Both"],                group="Filters")
 
 // ═══════════════════════════════════════════════════════
 // SESSION
@@ -78,11 +61,11 @@ hhmm      = hour * 100 + minute
 inSession = not useSession or (hhmm >= sessStart and hhmm <= sessEnd)
 
 // ═══════════════════════════════════════════════════════
-// KALMAN FILTER (unchanged)
+// KALMAN FILTER — unchanged from v1.2
 // ═══════════════════════════════════════════════════════
-var float kalmX = close
-var float kalmV = 0.0
-var float kalmP = 1.0
+var float kalmX  = close
+var float kalmV  = 0.0
+var float kalmP  = 1.0
 
 kalmXp = kalmX + kalmV
 kalmPp = kalmP + kalmQ
@@ -93,14 +76,54 @@ kalmV := kalmV  + kalmK * (close - kalmXp) * 0.1
 kalmP := (1 - kalmK) * kalmPp
 
 // ═══════════════════════════════════════════════════════
-// ATR + RESIDUAL (unchanged)
+// ATR-NORMALISED RESIDUAL — unchanged
 // ═══════════════════════════════════════════════════════
 atr       = ta.atr(atrLen)
 residual  = close - kalmX
 normResid = atr > 0 ? residual / atr : 0.0
 
 // ═══════════════════════════════════════════════════════
-// VELOCITY (unchanged)
+// GAP CIRCUIT BREAKER — NEW
+// Detects price discontinuities (news-driven gaps or wide-range bars)
+// and locks out entries for a cooldown period.
+//
+// Two triggers run in parallel:
+//   1. Opening gap: |open - prev close| > gapThresh * ATR
+//   2. Bar range spike: (high - low) > rangeThresh * ATR
+//
+// On either trigger, set bars_since_gap = 0. Lockout active until
+// bars_since_gap >= lockoutBars.
+// ═══════════════════════════════════════════════════════
+prevClose  = nz(close[1], close)
+gapSize    = math.abs(open - prevClose)
+barRange   = high - low
+
+gapTriggered   = atr > 0 and gapSize  > gapThresh   * atr
+rangeTriggered = atr > 0 and barRange > rangeThresh * atr
+anyGap         = gapTriggered or rangeTriggered
+
+var int barsSinceGap = lockoutBars + 1
+barsSinceGap := anyGap ? 0 : math.min(barsSinceGap + 1, lockoutBars + 1)
+gapOK = not useGapBreaker or barsSinceGap >= lockoutBars
+
+// ═══════════════════════════════════════════════════════
+// OU HALF-LIFE GATE — unchanged from v1.2
+// ═══════════════════════════════════════════════════════
+resLag   = residual[1]
+resDelta = residual - resLag
+
+meanX    = ta.sma(resLag,   ouLen)
+meanDX   = ta.sma(resDelta, ouLen)
+covXDX   = ta.sma((resLag - meanX) * (resDelta - meanDX), ouLen)
+varX     = ta.variance(resLag, ouLen)
+
+beta     = varX > 0 ? covXDX / varX : 0.0
+kappa    = -beta
+halfLife = kappa > 0 ? math.log(2) / kappa : 9999.0
+ouOK     = not useOuGate or (kappa > 0 and halfLife <= maxHalfLife)
+
+// ═══════════════════════════════════════════════════════
+// VELOCITY FILTER — unchanged
 // ═══════════════════════════════════════════════════════
 kalmVelAbs    = math.abs(kalmV)
 kalmVelSmooth = ta.ema(kalmVelAbs, velLen)
@@ -108,79 +131,37 @@ kalmVelNorm   = atr > 0 ? kalmVelSmooth / atr : 0.0
 velOK         = kalmVelNorm < maxVelMult
 
 // ═══════════════════════════════════════════════════════
-// VARIANCE RATIO (unchanged)
+// VARIANCE RATIO — unchanged
 // ═══════════════════════════════════════════════════════
-r1   = close - close[1]
-rN   = close - close[vrLen]
-var1 = ta.variance(r1, vrLen)
-varN = ta.variance(rN, vrLen)
-vr   = (var1 > 0) ? varN / (vrLen * var1) : 1.0
-vrMR = vr < vrThreshold
+r1      = close - close[1]
+rN      = close - close[vrLen]
+var1    = ta.variance(r1, vrLen)
+varN    = ta.variance(rN, vrLen)
+vr      = (var1 > 0) ? varN / (vrLen * var1) : 1.0
+vrMR    = vr < vrThreshold
 
 // ═══════════════════════════════════════════════════════
-// ✨ TREND VETO
+// COOLDOWN
 // ═══════════════════════════════════════════════════════
-[diPlusK, diMinusK, adxValK] = ta.dmi(adxLenK, adxLenK)
-
-emaF = ta.ema(close, emaFastTV)
-emaM = ta.ema(close, emaMidTV)
-emaS = ta.ema(close, emaSlowTV)
-
-emaBullStack   = emaF > emaM and emaM > emaS
-emaBearStack   = emaF < emaM and emaM < emaS
-emaTrending    = emaBullStack or emaBearStack
-adxTrending    = adxValK > adxTrendThresh
-marketTrending = adxTrending and emaTrending
-trendVetoActive = useTrendVeto and marketTrending
-
-// ═══════════════════════════════════════════════════════
-// ✨ RESIDUAL EXTREMENESS
-// ═══════════════════════════════════════════════════════
-residAbsPctile = ta.percentrank(math.abs(normResid), residLookback)
-residExtreme   = not useResidPctile or residAbsPctile >= residPctile
-
-// ═══════════════════════════════════════════════════════
-// ✨ VELOCITY ALIGNMENT VETO
-// ═══════════════════════════════════════════════════════
-velAccelerating        = kalmVelAbs > kalmVelSmooth
-trendBreakthroughLong  = kalmV < 0 and velAccelerating
-trendBreakthroughShort = kalmV > 0 and velAccelerating
-velAlignOkLong         = not useVelAlignVeto or not trendBreakthroughLong
-velAlignOkShort        = not useVelAlignVeto or not trendBreakthroughShort
-
-// ═══════════════════════════════════════════════════════
-// ✨ ASYMMETRIC COOLDOWN
-// ═══════════════════════════════════════════════════════
-var bool lastTradeWasLoss = false
-if strategy.closedtrades > nz(strategy.closedtrades[1])
-    lastIdx = strategy.closedtrades - 1
-    lastTradeWasLoss := strategy.closedtrades.profit(lastIdx) < 0
-
-effectiveCooldown = (useLossCooldown and lastTradeWasLoss) ? int(math.round(cooldown * lossCooldownMult)) : cooldown
-
 var int barsSince = cooldown + 1
-barsSince := strategy.position_size != 0 ? 0 : math.min(barsSince + 1, effectiveCooldown + 1)
-cooledDown = barsSince >= effectiveCooldown
+barsSince := strategy.position_size != 0 ? 0 : math.min(barsSince + 1, cooldown + 1)
+cooledDown = barsSince >= cooldown
 
 // ═══════════════════════════════════════════════════════
-// ENTRY CONDITIONS (original + new filters ANDed in)
+// ENTRIES — only change: added gapOK gate
 // ═══════════════════════════════════════════════════════
-baseLong  = normResid < -entryThresh and vrMR and velOK and inSession and cooledDown
-baseShort = normResid >  entryThresh and vrMR and velOK and inSession and cooledDown
-
-longCond  = baseLong  and not trendVetoActive and residExtreme and velAlignOkLong
-shortCond = baseShort and not trendVetoActive and residExtreme and velAlignOkShort
+longCond  = normResid < -entryThresh and vrMR and velOK and ouOK and gapOK and inSession and cooledDown
+shortCond = normResid >  entryThresh and vrMR and velOK and ouOK and gapOK and inSession and cooledDown
 
 goLong  = longCond  and (tradeDir == "Long Only"  or tradeDir == "Both")
 goShort = shortCond and (tradeDir == "Short Only" or tradeDir == "Both")
 
 // ═══════════════════════════════════════════════════════
-// EXITS
+// EXITS — unchanged
 // ═══════════════════════════════════════════════════════
 longExit  = normResid >= -exitThresh
 shortExit = normResid <=  exitThresh
 
-// ATR trail (unchanged)
 var float trailL = na
 var float trailS = na
 
@@ -192,26 +173,8 @@ if strategy.position_size == 0
     trailL := na
     trailS := na
 
-// ✨ Time stop with MFE tracking
-var int   barsInTrade = 0
-var float mfeAbs      = 0.0
-
-if strategy.position_size > 0
-    barsInTrade := barsInTrade + 1
-    mfeAbs      := math.max(mfeAbs, high - strategy.position_avg_price)
-else if strategy.position_size < 0
-    barsInTrade := barsInTrade + 1
-    mfeAbs      := math.max(mfeAbs, strategy.position_avg_price - low)
-else
-    barsInTrade := 0
-    mfeAbs      := 0.0
-
-mfeAtr        = atr > 0 ? mfeAbs / atr : 0.0
-timeStopLong  = useTimeStop and strategy.position_size > 0 and barsInTrade >= maxBarsInTrade and mfeAtr < minMfeAtr
-timeStopShort = useTimeStop and strategy.position_size < 0 and barsInTrade >= maxBarsInTrade and mfeAtr < minMfeAtr
-
 // ═══════════════════════════════════════════════════════
-// EXECUTION
+// EXECUTION — unchanged
 // ═══════════════════════════════════════════════════════
 if goLong  and strategy.position_size == 0
     strategy.entry("Long",  strategy.long)
@@ -223,18 +186,10 @@ if strategy.position_size > 0
 if strategy.position_size < 0
     strategy.exit("S-Trail", "Short", stop=trailS)
 
-// Ordered: revert first (normal case), then time stop (stalled case)
-if strategy.position_size > 0
-    if longExit
-        strategy.close("Long",  comment="Revert")
-    else if timeStopLong
-        strategy.close("Long",  comment="TimeStop")
-
-if strategy.position_size < 0
-    if shortExit
-        strategy.close("Short", comment="Revert")
-    else if timeStopShort
-        strategy.close("Short", comment="TimeStop")
+if strategy.position_size > 0 and longExit
+    strategy.close("Long",  comment="Revert")
+if strategy.position_size < 0 and shortExit
+    strategy.close("Short", comment="Revert")
 
 // ═══════════════════════════════════════════════════════
 // PLOTS
@@ -242,89 +197,24 @@ if strategy.position_size < 0
 residCol = normResid >  entryThresh ? color.new(color.red,  10) :
            normResid < -entryThresh ? color.new(color.lime, 10) :
                                       color.new(color.gray, 50)
-plot(normResid,   "Norm Residual",  color=residCol, linewidth=2)
+plot(normResid, "Norm Residual", color=residCol, linewidth=2)
 
-vrCol = vr < vrThreshold ? color.new(color.aqua,  30) :        vr > 1.0         ? color.new(color.orange,30) :                           color.new(color.gray,  50)
-plot(vr,          "Variance Ratio", color=vrCol,    linewidth=1)
-plot(kalmVelNorm, "Kalman Velocity",color=color.new(color.purple, 40), linewidth=1)
+vrCol = vr < vrThreshold ? color.new(color.aqua, 30) :        vr > 1.0         ? color.new(color.orange, 30) : color.new(color.gray, 50)
+plot(vr, "Variance Ratio", color=vrCol, linewidth=1)
 
-hline( entryThresh, "Entry Short",  color=color.new(color.red,  30), linestyle=hline.style_solid)
-hline(-entryThresh, "Entry Long",   color=color.new(color.lime, 30), linestyle=hline.style_solid)
-hline( exitThresh,  "Exit Short",   color=color.new(color.red,  60), linestyle=hline.style_dashed)
-hline(-exitThresh,  "Exit Long",    color=color.new(color.lime, 60), linestyle=hline.style_dashed)
-hline(vrThreshold,  "VR Threshold", color=color.new(color.aqua, 50), linestyle=hline.style_dotted)
-hline(1.0,          "VR=1 (RW)",    color=color.new(color.gray, 40), linestyle=hline.style_dotted)
-hline(0,            "Zero",         color=color.new(color.white,60), linestyle=hline.style_solid)
+plot(kalmVelNorm, "Kalman Velocity", color=color.new(color.purple, 40), linewidth=1)
 
-plotshape(goLong,  "Long",  shape.labelup,   location.absolute, color.lime, size=size.small, text="L", textcolor=color.black)
-plotshape(goShort, "Short", shape.labeldown, location.absolute, color.red,  size=size.small, text="S", textcolor=color.white)
+hlPlot = halfLife > 50 ? na : halfLife
+plot(hlPlot, "OU Half-Life", color=color.new(color.yellow, 30), linewidth=1)
 
-// Background: aqua = OK to trade, orange = regime unfit, red = trend veto
-bgcolor(trendVetoActive                                    ? color.new(color.red,    88) :       vrMR and velOK                                     ? color.new(color.aqua,   94) :                                                             color.new(color.orange, 94),
-     title="Regime BG")
+hline( entryThresh, "Entry Short",   color=color.new(color.red,  30), linestyle=hline.style_solid)
+hline(-entryThresh, "Entry Long",    color=color.new(color.lime, 30), linestyle=hline.style_solid)
+hline( exitThresh,  "Exit Short",    color=color.new(color.red,  60), linestyle=hline.style_dashed)
+hline(-exitThresh,  "Exit Long",     color=color.new(color.lime, 60), linestyle=hline.style_dashed)
+hline(vrThreshold,  "VR Threshold",  color=color.new(color.aqua, 50), linestyle=hline.style_dotted)
+hline(1.0,          "VR=1 (RW)",     color=color.new(color.gray, 40), linestyle=hline.style_dotted)
+hline(0,            "Zero",          color=color.new(color.white,60), linestyle=hline.style_solid)
 
-// ═══════════════════════════════════════════════════════
-// DASHBOARD
-// ═══════════════════════════════════════════════════════
-var table dash = table.new(position.top_right, 2, 10,
-     bgcolor=color.new(color.black, 72),
-     border_width=1, border_color=color.new(color.gray, 55))
-
-if barstate.islast
-    tradeState = trendVetoActive   ? "TREND — BLOCKED" :
-                 not vrMR          ? "TRENDING (VR)"   :
-                 not velOK         ? "FAST DRIFT"      :
-                 not residExtreme  ? "RESID NOT EXTR"  :
-                                     "MR OK"
-    stateColor = trendVetoActive                 ? color.red    :
-                 (not vrMR or not velOK)         ? color.orange :
-                 (not residExtreme)              ? color.yellow :
-                                                   color.lime
-
-    table.cell(dash, 0, 0, "Kalman Scalper v2", text_color=color.white, bgcolor=color.new(color.navy, 30), text_size=size.small)
-    table.cell(dash, 1, 0, "",                   bgcolor=color.new(color.navy, 30))
-
-    table.cell(dash, 0, 1, "State",          text_color=color.silver, text_size=size.small)
-    table.cell(dash, 1, 1, tradeState,       text_color=stateColor,   text_size=size.small)
-
-    table.cell(dash, 0, 2, "ADX",            text_color=color.silver, text_size=size.small)
-    table.cell(dash, 1, 2, str.tostring(math.round(adxValK, 1)),
-               text_color=adxTrending ? color.red : color.gray, text_size=size.small)
-
-    table.cell(dash, 0, 3, "EMA Stack",      text_color=color.silver, text_size=size.small)
-    table.cell(dash, 1, 3, emaBullStack ? "BULL" : emaBearStack ? "BEAR" : "Mixed",
-               text_color=emaTrending ? color.red : color.gray, text_size=size.small)
-
-    table.cell(dash, 0, 4, "VR",             text_color=color.silver, text_size=size.small)
-    table.cell(dash, 1, 4, str.tostring(math.round(vr, 3)),
-               text_color=vrMR ? color.lime : color.orange, text_size=size.small)
-
-    table.cell(dash, 0, 5, "|Resid| pctile", text_color=color.silver, text_size=size.small)
-    table.cell(dash, 1, 5, str.tostring(math.round(residAbsPctile, 0)) + "%",
-               text_color=residExtreme ? color.lime : color.gray, text_size=size.small)
-
-    table.cell(dash, 0, 6, "Norm Resid",     text_color=color.silver, text_size=size.small)
-    table.cell(dash, 1, 6, str.tostring(math.round(normResid, 2)),
-               text_color=color.white, text_size=size.small)
-
-    table.cell(dash, 0, 7, "Vel Norm",       text_color=color.silver, text_size=size.small)
-    table.cell(dash, 1, 7, str.tostring(math.round(kalmVelNorm, 3)),
-               text_color=velOK ? color.lime : color.orange, text_size=size.small)
-
-    table.cell(dash, 0, 8, "In Trade",       text_color=color.silver, text_size=size.small)
-    table.cell(dash, 1, 8, strategy.position_size != 0
-                           ? str.tostring(barsInTrade) + " bars, MFE=" + str.tostring(math.round(mfeAtr, 2)) + "R"
-                           : "—",
-               text_color=color.white, text_size=size.small)
-
-    table.cell(dash, 0, 9, "Last Trade",     text_color=color.silver, text_size=size.small)
-    table.cell(dash, 1, 9, strategy.closedtrades == 0 ? "—" : lastTradeWasLoss ? "LOSS (ext cd)" : "WIN",
-               text_color=lastTradeWasLoss ? color.red : color.lime, text_size=size.small)
-
-// ═══════════════════════════════════════════════════════
-// ALERTS
-// ═══════════════════════════════════════════════════════
-alertcondition(goLong,        "Kalman v2 Long",        "Kalman Scalper v2: LONG entry")
-alertcondition(goShort,       "Kalman v2 Short",       "Kalman Scalper v2: SHORT entry")
-alertcondition(timeStopLong,  "Kalman v2 Time Exit L", "Kalman Scalper v2: LONG time stop")
-alertcondition(timeStopShort, "Kalman v2 Time Exit S", "Kalman Scalper v2: SHORT time stop")
+// Background: red tint during gap lockout (visual diagnostic)
+bgcolor(useGapBreaker and not gapOK ? color.new(color.red, 85) :        vrMR and velOK and ouOK     ? color.new(color.aqua, 94) :                                      color.new(color.orange, 94),
+     title="Regime BG (Red=gap lockout, Aqua=all pass, Orange=trend)")
