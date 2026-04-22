@@ -1,5 +1,5 @@
 //@version=5
-strategy("Kalman Adaptive Scalper v1.4 — MCX Silver Micro",
+strategy("Kalman Adaptive Scalper v1.6 — MCX Silver Micro",
      overlay=false,
      default_qty_type=strategy.percent_of_equity,
      default_qty_value=2,
@@ -25,18 +25,22 @@ ouLen       = input.int(19,  "OU Fit Window (bars)",      group="OU Gate")
 maxHalfLife = input.int(90,  "Max Half-Life (bars)",      group="OU Gate")
 useOuGate   = input.bool(true,"Enable OU Gate",           group="OU Gate")
 
-// GAP CIRCUIT BREAKER — NEW
+// Gap Circuit Breaker
 useGapBreaker = input.bool(true, "Enable Gap Breaker",          group="Gap Breaker")
-gapThresh     = input.float(1.5, "Opening Gap Threshold (ATR)", group="Gap Breaker", step=0.1,
-     tooltip="If |open - prev close| exceeds this × ATR, trigger lockout. 1.5 catches news-driven gaps, lower=more sensitive.")
-rangeThresh   = input.float(2.5, "Bar Range Threshold (ATR)",   group="Gap Breaker", step=0.1,
-     tooltip="If bar high-low range exceeds this × ATR, trigger lockout. Catches intrabar news spikes. 2.5 typical.")
-lockoutBars   = input.int(20,   "Lockout Period (bars)",        group="Gap Breaker",
-     tooltip="Bars to disable entries after gap detection. 20 on 5m = 100 min for Kalman to catch up and volatility to settle.")
+gapThresh     = input.float(1.5, "Opening Gap Threshold (ATR)", group="Gap Breaker", step=0.1)
+rangeThresh   = input.float(2.5, "Bar Range Threshold (ATR)",   group="Gap Breaker", step=0.1)
+lockoutBars   = input.int(20,   "Lockout Period (bars)",        group="Gap Breaker")
 
 // Regime filter — Variance Ratio
 vrLen        = input.int(36,   "Variance Ratio Lookback",     group="Regime Filter")
 vrThreshold  = input.float(0.7,"Max Variance Ratio (VR<1=MR)",group="Regime Filter", step=0.05)
+
+// HURST R/S PROXY — NEW — acts as extreme-trending veto only
+useHurstGate    = input.bool(true, "Enable Hurst Gate",        group="Hurst Filter")
+hurstLen        = input.int(64, "Hurst Lookback",               group="Hurst Filter",
+     tooltip="Bars used for R/S computation. Pine limits make 32-96 practical. 64 is standard.")
+hurstMaxH       = input.float(0.60, "Max H (block if exceeded)",group="Hurst Filter", step=0.01,
+     tooltip="Block entries when Hurst exponent exceeds this (strong trending). 0.5=random walk. 0.6 catches sustained trends without over-blocking.")
 
 // Velocity filter
 velLen       = input.int(9,    "Velocity Smoothing",          group="Velocity Filter")
@@ -61,7 +65,7 @@ hhmm      = hour * 100 + minute
 inSession = not useSession or (hhmm >= sessStart and hhmm <= sessEnd)
 
 // ═══════════════════════════════════════════════════════
-// KALMAN FILTER — unchanged from v1.2
+// KALMAN FILTER — unchanged
 // ═══════════════════════════════════════════════════════
 var float kalmX  = close
 var float kalmV  = 0.0
@@ -83,16 +87,7 @@ residual  = close - kalmX
 normResid = atr > 0 ? residual / atr : 0.0
 
 // ═══════════════════════════════════════════════════════
-// GAP CIRCUIT BREAKER — NEW
-// Detects price discontinuities (news-driven gaps or wide-range bars)
-// and locks out entries for a cooldown period.
-//
-// Two triggers run in parallel:
-//   1. Opening gap: |open - prev close| > gapThresh * ATR
-//   2. Bar range spike: (high - low) > rangeThresh * ATR
-//
-// On either trigger, set bars_since_gap = 0. Lockout active until
-// bars_since_gap >= lockoutBars.
+// GAP CIRCUIT BREAKER — unchanged
 // ═══════════════════════════════════════════════════════
 prevClose  = nz(close[1], close)
 gapSize    = math.abs(open - prevClose)
@@ -107,7 +102,7 @@ barsSinceGap := anyGap ? 0 : math.min(barsSinceGap + 1, lockoutBars + 1)
 gapOK = not useGapBreaker or barsSinceGap >= lockoutBars
 
 // ═══════════════════════════════════════════════════════
-// OU HALF-LIFE GATE — unchanged from v1.2
+// OU HALF-LIFE GATE — unchanged
 // ═══════════════════════════════════════════════════════
 resLag   = residual[1]
 resDelta = residual - resLag
@@ -141,6 +136,78 @@ vr      = (var1 > 0) ? varN / (vrLen * var1) : 1.0
 vrMR    = vr < vrThreshold
 
 // ═══════════════════════════════════════════════════════
+// HURST R/S PROXY — NEW
+// Computes rescaled range over the last hurstLen bars.
+// R/S relationship: R/S ∝ n^H where H is the Hurst exponent.
+// Single-scale proxy: H ≈ log(R/S) / log(n)
+// This is the Peters (1994) simplified form — not the full
+// multi-scale Mandelbrot R/S, but tracks the full version
+// closely in practice for real-time filtering.
+//
+// Steps:
+//   1. Compute log-returns over window
+//   2. Build cumulative deviation from mean
+//   3. R = max(cumdev) - min(cumdev)
+//   4. S = stdev of returns
+//   5. H = log(R/S) / log(n)
+//
+// Interpretation:
+//   H < 0.5 → anti-persistent (mean-reverting)
+//   H ≈ 0.5 → random walk
+//   H > 0.5 → persistent (trending)
+//
+// Gate: block entries when H > hurstMaxH (extreme trending only)
+// ═══════════════════════════════════════════════════════
+
+// Build log-return series, then cumulative deviation from mean,
+// then compute R (range of cumdev) and S (stdev of returns).
+// In Pine, we iterate over the lookback on every bar — acceptable
+// at hurstLen = 64.
+
+hurstH = 0.5  // default to random walk when insufficient data
+
+if bar_index >= hurstLen
+    // 1. Mean log-return over window
+    float sumRet = 0.0
+    for i = 0 to hurstLen - 1
+        ret = math.log(close[i] / close[i + 1])
+        sumRet += ret
+    meanRet = sumRet / hurstLen
+
+    // 2. Compute cumulative deviation series and track min/max
+    //    Also accumulate sum-of-squared-deviations for S
+    float cumDev    = 0.0
+    float cumDevMin = 0.0
+    float cumDevMax = 0.0
+    float sumSqDev  = 0.0
+    for i = 0 to hurstLen - 1
+        ret = math.log(close[hurstLen - 1 - i] / close[hurstLen - i])
+        dev = ret - meanRet
+        cumDev += dev
+        cumDevMin := math.min(cumDevMin, cumDev)
+        cumDevMax := math.max(cumDevMax, cumDev)
+        sumSqDev  += dev * dev
+
+    // 3. R = range of cumulative deviation
+    R = cumDevMax - cumDevMin
+
+    // 4. S = stdev of returns (population form)
+    S = math.sqrt(sumSqDev / hurstLen)
+
+    // 5. H = log(R/S) / log(n)
+    //    Clamp R/S to avoid log(0); minimum meaningful R/S is ~1
+    if S > 0 and R > 0
+        rs = R / S
+        if rs > 1.0
+            hurstH := math.log(rs) / math.log(hurstLen)
+        else
+            hurstH := 0.5  // degenerate case, treat as random walk
+
+// Gate: block only when Hurst indicates EXTREME trending
+// (not just any H > 0.5 — that would overlap too much with VR)
+hurstOK = not useHurstGate or hurstH <= hurstMaxH
+
+// ═══════════════════════════════════════════════════════
 // COOLDOWN
 // ═══════════════════════════════════════════════════════
 var int barsSince = cooldown + 1
@@ -148,10 +215,10 @@ barsSince := strategy.position_size != 0 ? 0 : math.min(barsSince + 1, cooldown 
 cooledDown = barsSince >= cooldown
 
 // ═══════════════════════════════════════════════════════
-// ENTRIES — only change: added gapOK gate
+// ENTRIES — now with six gates (added hurstOK)
 // ═══════════════════════════════════════════════════════
-longCond  = normResid < -entryThresh and vrMR and velOK and ouOK and gapOK and inSession and cooledDown
-shortCond = normResid >  entryThresh and vrMR and velOK and ouOK and gapOK and inSession and cooledDown
+longCond  = normResid < -entryThresh and vrMR and velOK and ouOK and gapOK and hurstOK and inSession and cooledDown
+shortCond = normResid >  entryThresh and vrMR and velOK and ouOK and gapOK and hurstOK and inSession and cooledDown
 
 goLong  = longCond  and (tradeDir == "Long Only"  or tradeDir == "Both")
 goShort = shortCond and (tradeDir == "Short Only" or tradeDir == "Both")
@@ -199,13 +266,17 @@ residCol = normResid >  entryThresh ? color.new(color.red,  10) :
                                       color.new(color.gray, 50)
 plot(normResid, "Norm Residual", color=residCol, linewidth=2)
 
-vrCol = vr < vrThreshold ? color.new(color.aqua, 30) :        vr > 1.0         ? color.new(color.orange, 30) : color.new(color.gray, 50)
+vrCol = vr < vrThreshold ? color.new(color.aqua, 30) :        vr > 1.0         ? color.new(color.orange, 30) :                           color.new(color.gray, 50)
 plot(vr, "Variance Ratio", color=vrCol, linewidth=1)
 
 plot(kalmVelNorm, "Kalman Velocity", color=color.new(color.purple, 40), linewidth=1)
 
 hlPlot = halfLife > 50 ? na : halfLife
 plot(hlPlot, "OU Half-Life", color=color.new(color.yellow, 30), linewidth=1)
+
+// NEW: Hurst plot — orange when extreme trending, green when mean-reverting
+hurstCol = hurstH > hurstMaxH ? color.new(color.orange, 20) :           hurstH < 0.5       ? color.new(color.green,  30) :                                color.new(color.gray,   50)
+plot(hurstH, "Hurst H", color=hurstCol, linewidth=1)
 
 hline( entryThresh, "Entry Short",   color=color.new(color.red,  30), linestyle=hline.style_solid)
 hline(-entryThresh, "Entry Long",    color=color.new(color.lime, 30), linestyle=hline.style_solid)
@@ -215,6 +286,10 @@ hline(vrThreshold,  "VR Threshold",  color=color.new(color.aqua, 50), linestyle=
 hline(1.0,          "VR=1 (RW)",     color=color.new(color.gray, 40), linestyle=hline.style_dotted)
 hline(0,            "Zero",          color=color.new(color.white,60), linestyle=hline.style_solid)
 
-// Background: red tint during gap lockout (visual diagnostic)
-bgcolor(useGapBreaker and not gapOK ? color.new(color.red, 85) :        vrMR and velOK and ouOK     ? color.new(color.aqua, 94) :                                      color.new(color.orange, 94),
+// NEW: Hurst reference lines
+hline(hurstMaxH,    "Hurst Block",   color=color.new(color.orange,30), linestyle=hline.style_dotted)
+hline(0.5,          "H=0.5 (RW)",    color=color.new(color.gray,  40), linestyle=hline.style_dotted)
+
+bgcolor(useGapBreaker and not gapOK ? color.new(color.red, 85) :        vrMR and velOK and ouOK and hurstOK ? color.new(color.aqua, 94) :
+                                              color.new(color.orange, 94),
      title="Regime BG (Red=gap lockout, Aqua=all pass, Orange=trend)")
