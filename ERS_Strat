@@ -45,25 +45,25 @@ strategy("SILVERMIC · Expansion Regime Swing [ERS]",
 // ══════════════════════════════════════════════════════════════════════════════
 
 // ─── Regime Detection ───────────────────────────────────────────────────────
-adx_len          = input.int   (14,    "ADX Length",             group="⚙ Regime Detection", minval=5)
-adx_thresh       = input.float (22.0,  "ADX Threshold",          group="⚙ Regime Detection", step=0.5,                                tooltip="ADX above this level → directional momentum active (classic = 25; 22 gives earlier signal)")
+adx_len          = input.int   (6,    "ADX Length",             group="⚙ Regime Detection", minval=5)
+adx_thresh       = input.float (17.0,  "ADX Threshold",          group="⚙ Regime Detection", step=0.5,                                tooltip="ADX above this level → directional momentum active (classic = 25; 22 gives earlier signal)")
 atr_len          = input.int   (14,    "ATR Length",             group="⚙ Regime Detection", minval=5)
 atr_base_len     = input.int   (50,    "ATR Baseline MA",        group="⚙ Regime Detection",                                tooltip="SMA length to establish ATR mean. Ratio = Current ATR / this MA")
-atr_exp_thresh   = input.float (1.10,  "ATR Expansion Ratio",    group="⚙ Regime Detection", step=0.05,                                tooltip="ATR/Baseline > this value confirms volatility expansion (1.10 = 10% above mean)")
+atr_exp_thresh   = input.float (1.5,  "ATR Expansion Ratio",    group="⚙ Regime Detection", step=0.05,                                tooltip="ATR/Baseline > this value confirms volatility expansion (1.10 = 10% above mean)")
 bb_len           = input.int   (20,    "BB Length",              group="⚙ Regime Detection")
 bb_mult          = input.float (2.0,   "BB Multiplier",          group="⚙ Regime Detection", step=0.1)
 bb_base_len      = input.int   (50,    "BB Width Baseline MA",   group="⚙ Regime Detection",                                tooltip="BB Width vs this MA baseline determines expansion phase")
 
 // ─── Trend Filters ──────────────────────────────────────────────────────────
-ema_fast         = input.int   (21,    "Fast EMA",               group="📈 Trend Filter")
+ema_fast         = input.int   (20,    "Fast EMA",               group="📈 Trend Filter")
 ema_mid          = input.int   (50,    "Mid EMA",                group="📈 Trend Filter")
 ema_slow         = input.int   (200,   "Slow EMA",               group="📈 Trend Filter")
-lr_len           = input.int   (20,    "LR Slope Length",        group="📈 Trend Filter")
-lr_thresh        = input.float (0.10,  "Norm. LR Slope Threshold", group="📈 Trend Filter", step=0.01,                                tooltip="Slope / ATR must exceed this. 0.10 = price moves >10% of ATR per bar in trend direction")
+lr_len           = input.int   (16,    "LR Slope Length",        group="📈 Trend Filter")
+lr_thresh        = input.float (0.12,  "Norm. LR Slope Threshold", group="📈 Trend Filter", step=0.01,                                tooltip="Slope / ATR must exceed this. 0.10 = price moves >10% of ATR per bar in trend direction")
 
 // ─── Entry ──────────────────────────────────────────────────────────────────
 swing_lb         = input.int   (20,    "Swing High/Low Lookback",group="🎯 Entry")
-rsi_len          = input.int   (14,    "RSI Length",             group="🎯 Entry")
+rsi_len          = input.int   (19,    "RSI Length",             group="🎯 Entry")
 min_score        = input.int   (3,     "Min Regime Score (0–5)", group="🎯 Entry", minval=1, maxval=5,                                tooltip="Regime score must reach this threshold before entries are allowed")
 use_breakout     = input.bool  (true,  "Enable Breakout Entries",group="🎯 Entry")
 use_pullback     = input.bool  (true,  "Enable Pullback Entries",group="🎯 Entry")
